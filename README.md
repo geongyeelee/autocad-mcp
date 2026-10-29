@@ -61,6 +61,29 @@ codex mcp add autocad -- /path/to/autocad-mcp/.venv/bin/autocad-mcp
 
 ---
 
+## Reliability & Unified Diagnostic Fields (v0.2.0)
+
+Every tool response includes 17 unified diagnostic fields for full observability across both Live GUI and Headless `AcCoreConsole` modes:
+
+```text
+requested_mode / actual_mode / fallback_reason
+request_id / elapsed_ms / execution_stage
+active_document / command_names / busy / modal_dialog
+script_success / command_success
+output_exists / output_size / reopen_verified
+error_code / raw_log_path
+```
+
+Key v0.2.0 hardening highlights:
+- **Granular Live Readiness**: Separates `bridge_online`, `drawing_ready`, and `command_executable`, inspecting `[NSApp modalWindow]`, `CMDACTIVE` (interactive bits `1|2|8`), and `CMDNAMES` on the Cocoa main thread with a bounded timeout.
+- **Anti-Reentrancy & Event-Loop Wakeup**: Prevents main-thread stalls by waking the Cocoa runloop with `NSEventTypeApplicationDefined`, waiting briefly (`~600ms`) for trailing commands to unwind, and explicitly rejecting or cancelling (`CANCELCMD`) when busy (`COMMAND_ACTIVE_BUSY` / `MODAL_DIALOG_ACTIVE`).
+- **Verified DWG Persistence**: `save_as_dwg` and `export_drawing` verify file existence, non-empty size, `AC10...` header magic, and headless reopen verification (`reopen_verified: true`) before returning `saved_dwg`.
+- **Full UTF-8 / CJK Path & Output Support**: Uses `(open path mode "utf8")` in AutoLISP and multi-encoding fallback (`utf-8` → `utf-16-le` → `gb18030`) with raw byte logs preserved at `/tmp/autocad_mcp_logs/<request_id>.log`.
+- **Strict Live Mode (`require_live`)**: Disables silent fallback to a blank headless `Drawing1.dwg` when querying or modifying the foreground drawing unless `allow_headless_fallback=True` or `input_dwg` is specified.
+- **Verified Document Open**: `inspect_or_create_dxf(open_in_autocad=True)` separates `open_dispatched` from `document_loaded_verified` and confirms `loaded_entity_count` in the newly opened document.
+
+---
+
 ## Running Tests
 
 ```bash

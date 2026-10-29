@@ -1,7 +1,7 @@
 import json
 import logging
-import math
 import subprocess
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -18,10 +18,13 @@ from .connection import (
     AUTOCAD_APP_PATH,
     BRIDGE_CRX_PATH,
     HELPERS_LSP_PATH,
+    ensure_diagnostic_fields,
     execute_autolisp_dual_mode,
     get_console_runner,
     get_live_connection,
     is_autocad_gui_running,
+    new_request_id,
+    open_and_verify_in_autocad,
 )
 
 logging.basicConfig(
@@ -43,7 +46,7 @@ def _lisp_pt(pt: Optional[List[float]], default: Optional[List[float]] = None) -
     x = float(coords[0]) if len(coords) > 0 else 0.0
     y = float(coords[1]) if len(coords) > 1 else 0.0
     z = float(coords[2]) if len(coords) > 2 else 0.0
-    return f'(list {x:.8f} {y:.8f} {z:.8f})'
+    return f"(list {x:.8f} {y:.8f} {z:.8f})"
 
 
 def _lisp_opt_str(val: Optional[str]) -> str:
@@ -60,7 +63,7 @@ def _json_response(data: Any) -> str:
 
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
-    logger.info("AutoCAD 2027 MCP Server starting up")
+    logger.info("AutoCAD 2027 MCP Server v0.2.0 starting up")
     try:
         if is_autocad_gui_running():
             conn = get_live_connection()
@@ -78,9 +81,10 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
 mcp = FastMCP(
     "AutoCADMCP",
     instructions=(
-        "AutoCAD 2027 for Mac integration through the Model Context Protocol. "
+        "AutoCAD 2027 for Mac integration through the Model Context Protocol (v0.2.0). "
         "Supports real-time GUI drawing/inspection via a native C++/AutoLISP bridge, "
-        "headless batch processing via AcCoreConsole, and direct DXF operations via ezdxf."
+        "headless batch processing via AcCoreConsole with UTF-8 + reopen verification, "
+        "and direct DXF operations via ezdxf."
     ),
     lifespan=server_lifespan,
 )
@@ -91,38 +95,70 @@ def get_connection_status(
     ctx: Context,
     auto_bootstrap: bool = True,
 ) -> str:
-    """Check AutoCAD 2027 GUI process, live TCP bridge (127.0.0.1:9877), and AcCoreConsole status.
+    """Check AutoCAD 2027 GUI process, live TCP bridge (127.0.0.1:9877), drawing readiness, command executability, and AcCoreConsole status.
 
     Args:
         auto_bootstrap: If True and the live bridge is not yet connected, automatically open a workspace drawing in AutoCAD 2027 to load the native bridge.
     """
+    t0 = time.time()
+    req_id = new_request_id("status")
     gui_running = is_autocad_gui_running()
     live = get_live_connection()
     connected = live.connect(timeout=0.5)
-    ping_info = None
+    status_info: Dict[str, Any] = {}
 
     if not connected and auto_bootstrap:
         connected = live.bootstrap_live_bridge(launch_if_needed=True)
 
     if connected:
         try:
-            ping_info = live.ping()
+            status_info = live.status(auto_bootstrap=False)
         except Exception as e:
-            ping_info = {"error": str(e)}
+            status_info = {"ok": False, "error": str(e)}
+
+    bridge_online = bool(connected and status_info.get("ok", False))
+    drawing_ready = bool(status_info.get("drawing_ready", False))
+    command_executable = bool(status_info.get("command_executable", False))
+    busy = bool(status_info.get("busy", False))
+    modal_dialog = bool(status_info.get("modal_dialog", False))
+    active_document = status_info.get("active_document") or None
+    command_names = status_info.get("command_names") or ""
 
     console_runner = get_console_runner()
+    payload: Dict[str, Any] = {
+        "ok": bridge_online or console_runner.is_available(),
+        "autocad_app_path": AUTOCAD_APP_PATH,
+        "gui_process_running": gui_running,
+        "live_bridge_connected": connected,
+        "bridge_online": bridge_online,
+        "main_thread_responsive": bool(status_info.get("main_thread_responsive", False)),
+        "drawing_ready": drawing_ready,
+        "command_executable": command_executable,
+        "active_document": active_document,
+        "command_names": command_names,
+        "busy": busy,
+        "modal_dialog": modal_dialog,
+        "modal_window_title": status_info.get("modal_window_title", ""),
+        "live_bridge_endpoint": f"{live.host}:{live.port}",
+        "live_bridge_ping": status_info if status_info else None,
+        "accoreconsole_available": console_runner.is_available(),
+        "accoreconsole_path": ACCORECONSOLE_PATH,
+        "bridge_crx_exists": BRIDGE_CRX_PATH.exists(),
+        "helpers_lsp_exists": HELPERS_LSP_PATH.exists(),
+        "script_success": True,
+        "command_success": True,
+        "error_code": None if (bridge_online or console_runner.is_available()) else "NO_BACKEND_AVAILABLE",
+    }
     return _json_response(
-        {
-            "autocad_app_path": AUTOCAD_APP_PATH,
-            "gui_process_running": gui_running,
-            "live_bridge_connected": connected,
-            "live_bridge_endpoint": f"{live.host}:{live.port}",
-            "live_bridge_ping": ping_info,
-            "accoreconsole_available": console_runner.is_available(),
-            "accoreconsole_path": ACCORECONSOLE_PATH,
-            "bridge_crx_exists": BRIDGE_CRX_PATH.exists(),
-            "helpers_lsp_exists": HELPERS_LSP_PATH.exists(),
-        }
+        ensure_diagnostic_fields(
+            payload,
+            requested_mode="live_gui",
+            actual_mode="live_gui" if bridge_online else "accoreconsole",
+            fallback_reason=None if bridge_online else "Live bridge not connected",
+            request_id=req_id,
+            elapsed_ms=int((time.time() - t0) * 1000),
+            execution_stage="status_checked",
+        )
     )
 
 
@@ -131,15 +167,21 @@ def eval_autolisp(
     ctx: Context,
     code: str,
     prefer_live: bool = True,
+    require_live: bool = False,
+    auto_cancel_active_command: bool = False,
+    verify_reopen: bool = True,
     timeout_ms: int = 15000,
     input_dwg: Optional[str] = None,
     save_as_dwg: Optional[str] = None,
 ) -> str:
-    """Evaluate arbitrary AutoLISP code in AutoCAD 2027 and return the serialized result.
+    """Evaluate arbitrary AutoLISP code in AutoCAD 2027 and return the serialized result with full diagnostics.
 
     Args:
         code: AutoLISP expression(s) to evaluate, e.g. '(getvar "ACADVER")' or '(mcp:make-line ...)'.
-        prefer_live: Use the live AutoCAD 2027 GUI window if available; falls back to headless AcCoreConsole if False or if input_dwg is provided.
+        prefer_live: Use the live AutoCAD 2027 GUI window if available; uses headless AcCoreConsole if False or if input_dwg is provided.
+        require_live: If True, strictly require live GUI execution and never fall back to AcCoreConsole.
+        auto_cancel_active_command: If True and an interactive command is active in the GUI, send ESC ESC before executing.
+        verify_reopen: When save_as_dwg is specified, verify the saved file exists, is non-empty, and reopens cleanly in AcCoreConsole.
         timeout_ms: Execution timeout in milliseconds.
         input_dwg: Optional path to an existing .dwg file to process in headless AcCoreConsole mode.
         save_as_dwg: Optional path to save the resulting .dwg file when running in headless mode.
@@ -147,6 +189,9 @@ def eval_autolisp(
     res = execute_autolisp_dual_mode(
         code=code,
         prefer_live=prefer_live,
+        require_live=require_live,
+        auto_cancel_active_command=auto_cancel_active_command,
+        verify_reopen=verify_reopen,
         timeout_ms=timeout_ms,
         input_dwg=input_dwg,
         save_as_dwg=save_as_dwg,
@@ -164,20 +209,56 @@ def send_command(
     Args:
         command: Raw AutoCAD command sequence (e.g. '_.ZOOM _E' or '_.REGEN').
     """
+    t0 = time.time()
+    req_id = new_request_id("cmd")
     live = get_live_connection()
-    res = live.post_command(command)
-    return _json_response(res)
+    try:
+        res = live.post_command(command)
+        return _json_response(
+            ensure_diagnostic_fields(
+                res,
+                requested_mode="live_gui",
+                actual_mode="live_gui",
+                request_id=req_id,
+                elapsed_ms=int((time.time() - t0) * 1000),
+                execution_stage="command_dispatched" if res.get("ok") else "dispatch_failed",
+            )
+        )
+    except Exception as e:
+        return _json_response(
+            ensure_diagnostic_fields(
+                {
+                    "ok": False,
+                    "script_success": False,
+                    "command_success": False,
+                    "error_code": "LIVE_BRIDGE_UNAVAILABLE",
+                    "error": str(e),
+                },
+                requested_mode="live_gui",
+                actual_mode="live_gui",
+                request_id=req_id,
+                elapsed_ms=int((time.time() - t0) * 1000),
+                execution_stage="dispatch_failed",
+            )
+        )
 
 
 @mcp.tool()
 def get_drawing_info(
     ctx: Context,
     input_dwg: Optional[str] = None,
+    require_live: bool = False,
 ) -> str:
-    """Get metadata, system variables, bounds, and entity count of the active drawing (or a file via input_dwg)."""
+    """Get metadata, system variables, bounds, and entity count of the active drawing (or a file via input_dwg).
+
+    Args:
+        input_dwg: Optional path to a .dwg file to inspect in headless AcCoreConsole mode.
+        require_live: If True, strictly require live foreground AutoCAD execution.
+    """
     res = execute_autolisp_dual_mode(
         code="(mcp:get-doc-info)",
         prefer_live=(input_dwg is None),
+        require_live=require_live or (input_dwg is None),
         input_dwg=input_dwg,
     )
     return _json_response(res)
@@ -374,23 +455,6 @@ def add_dimension(
     """
     cmd_name = "_.DIMALIGNED" if dim_type.lower() == "aligned" else "_.DIMLINEAR"
     code = f"""
-    (let ((old-osmode (getvar "OSMODE"))
-          (old-clayer (getvar "CLAYER")))
-      (setvar "OSMODE" 0)
-      (if {_lisp_opt_str(layer)}
-        (progn
-          (mcp:ensure-layer {_lisp_opt_str(layer)} nil nil)
-          (setvar "CLAYER" {_lisp_opt_str(layer)})
-        )
-      )
-      (command "{cmd_name}" {_lisp_pt(point1)} {_lisp_pt(point2)} {_lisp_pt(dim_line_point)})
-      (setvar "OSMODE" old-osmode)
-      (setvar "CLAYER" old-clayer)
-      (mcp:raw-json (mcp:entity-to-json-str (entlast)))
-    )
-    """
-    # Use AutoLISP lambda instead of let for standard AutoLISP compatibility
-    code = f"""
     ((lambda ( / old-osmode old-clayer)
        (setq old-osmode (getvar "OSMODE")
              old-clayer (getvar "CLAYER"))
@@ -433,7 +497,7 @@ def draw_hatch(
     """
     pat_upper = pattern.upper()
     if pat_upper == "SOLID":
-        hatch_cmd = f'(command "_.-HATCH" "_P" "SOLID" "_S" en "" "")'
+        hatch_cmd = '(command "_.-HATCH" "_P" "SOLID" "_S" en "" "")'
     else:
         hatch_cmd = (
             f'(command "_.-HATCH" "_P" {_lisp_str(pat_upper)} '
@@ -713,7 +777,6 @@ def manage_block(
              (if (setq en (handent h))
                (progn
                  (setq ed (entget en))
-                 ;; Strip entity name, handle, owner pointers
                  (setq ed
                    (vl-remove-if
                      '(lambda (pair) (member (car pair) '(-1 5 330)))
@@ -725,7 +788,6 @@ def manage_block(
              )
            )
            (entmake '((0 . "ENDBLK")))
-           ;; Also insert an instance at the base point so the geometry remains visible
            (foreach h hlist
              (if (setq en (handent h)) (entdel en))
            )
@@ -740,7 +802,7 @@ def manage_block(
 @mcp.tool()
 def get_selection(ctx: Context) -> str:
     """Get all currently or previously selected entities in the active AutoCAD 2027 drawing."""
-    res = execute_autolisp_dual_mode("(mcp:get-selection)", prefer_live=True)
+    res = execute_autolisp_dual_mode("(mcp:get-selection)", prefer_live=True, require_live=True)
     return _json_response(res)
 
 
@@ -751,6 +813,7 @@ def query_entities(
     layer: Optional[str] = None,
     limit: int = 100,
     input_dwg: Optional[str] = None,
+    require_live: bool = False,
 ) -> str:
     """Query entities in the active drawing (or a DWG file) with optional type and layer filters.
 
@@ -759,6 +822,7 @@ def query_entities(
         layer: Optional layer name filter.
         limit: Maximum number of entity records to return (default 100).
         input_dwg: Optional path to a .dwg file to inspect in headless mode.
+        require_live: If True, strictly require live foreground AutoCAD execution.
     """
     code = (
         f"(mcp:query-entities {_lisp_opt_str(entity_type)} "
@@ -767,6 +831,7 @@ def query_entities(
     res = execute_autolisp_dual_mode(
         code=code,
         prefer_live=(input_dwg is None),
+        require_live=require_live or (input_dwg is None),
         input_dwg=input_dwg,
     )
     return _json_response(res)
@@ -777,16 +842,19 @@ def export_drawing(
     ctx: Context,
     output_path: str,
     format: str = "dwg",
+    verify_reopen: bool = True,
 ) -> str:
-    """Save or export the active AutoCAD 2027 drawing to DWG, DXF, PDF, or PNG.
+    """Save or export the active AutoCAD 2027 drawing to DWG, DXF, PDF, or PNG with file & reopen verification.
 
     Args:
         output_path: Target file path (e.g. '/tmp/output.dwg', '/tmp/output.dxf', '/tmp/output.pdf', '/tmp/preview.png').
         format: One of 'dwg', 'dxf', 'pdf', 'png'.
+        verify_reopen: When format='dwg', verify the saved file exists, is non-empty, and reopens cleanly in AcCoreConsole.
     """
     fmt = format.lower().strip()
-    abs_out = str(Path(output_path).expanduser().resolve())
-    Path(abs_out).parent.mkdir(parents=True, exist_ok=True)
+    out_file = Path(output_path).expanduser().resolve()
+    abs_out = str(out_file)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
 
     if fmt == "dwg":
         code = f"""
@@ -814,48 +882,113 @@ def export_drawing(
            )
          ))
         """
-        return _json_response(execute_autolisp_dual_mode(code))
+        res = execute_autolisp_dual_mode(code, prefer_live=True, require_live=True)
+        if verify_reopen:
+            vinfo = get_console_runner().verify_dwg_reopen(abs_out)
+        else:
+            exists = out_file.is_file()
+            sz = out_file.stat().st_size if exists else 0
+            vinfo = {"output_exists": exists, "output_size": sz, "reopen_verified": None}
 
-    if fmt == "dxf":
-        Path(abs_out).unlink(missing_ok=True)
-        code = f"""
-        ((lambda ( / old-fd old-exp)
-           (setq old-fd (getvar "FILEDIA")
-                 old-exp (getvar "EXPERT"))
-           (setvar "FILEDIA" 0)
-           (setvar "EXPERT" 5)
-           (command "_.DXFOUT" {_lisp_str(abs_out)} "16")
-           (setvar "FILEDIA" old-fd)
-           (setvar "EXPERT" old-exp)
-           (mcp:raw-json
-             (strcat "{{\\"saved\\":true,\\"format\\":\\"dxf\\",\\"path\\":" (mcp:to-json {_lisp_str(abs_out)}) "}}")
-           )
-         ))
-        """
-        return _json_response(execute_autolisp_dual_mode(code))
+        res["output_exists"] = vinfo.get("output_exists", False)
+        res["output_size"] = vinfo.get("output_size", 0)
+        res["reopen_verified"] = vinfo.get("reopen_verified")
+        if not res["output_exists"] or (verify_reopen and not res["reopen_verified"]):
+            res["ok"] = False
+            res["command_success"] = False
+            res["saved_dwg"] = None
+            res["execution_stage"] = "output_verification_failed"
+            res["error_code"] = vinfo.get("error_code") or "SAVE_VERIFICATION_FAILED"
+            res["error"] = vinfo.get("error") or f"Failed to verify exported DWG at {abs_out}"
+        else:
+            res["saved_dwg"] = abs_out
+            res["execution_stage"] = "output_verified"
+        return _json_response(res)
 
-    if fmt == "pdf":
-        Path(abs_out).unlink(missing_ok=True)
-        code = f"""
-        (progn
-          (command "_.ZOOM" "_E")
-          (command "_.-EXPORT" "_PDF" "_E" "_N" {_lisp_str(abs_out)})
-          (mcp:raw-json
-            (strcat "{{\\"saved\\":true,\\"format\\":\\"pdf\\",\\"path\\":" (mcp:to-json {_lisp_str(abs_out)}) "}}")
-          )
-        )
-        """
-        return _json_response(execute_autolisp_dual_mode(code))
+    if fmt in ("dxf", "pdf"):
+        out_file.unlink(missing_ok=True)
+        if fmt == "dxf":
+            code = f"""
+            ((lambda ( / old-fd old-exp)
+               (setq old-fd (getvar "FILEDIA")
+                     old-exp (getvar "EXPERT"))
+               (setvar "FILEDIA" 0)
+               (setvar "EXPERT" 5)
+               (command "_.DXFOUT" {_lisp_str(abs_out)} "16")
+               (setvar "FILEDIA" old-fd)
+               (setvar "EXPERT" old-exp)
+               (mcp:raw-json
+                 (strcat "{{\\"saved\\":true,\\"format\\":\\"dxf\\",\\"path\\":" (mcp:to-json {_lisp_str(abs_out)}) "}}")
+               )
+             ))
+            """
+        else:
+            code = f"""
+            (progn
+              (command "_.ZOOM" "_E")
+              (command "_.-EXPORT" "_PDF" "_E" "_N" {_lisp_str(abs_out)})
+              (mcp:raw-json
+                (strcat "{{\\"saved\\":true,\\"format\\":\\"pdf\\",\\"path\\":" (mcp:to-json {_lisp_str(abs_out)}) "}}")
+              )
+            )
+            """
+        res = execute_autolisp_dual_mode(code, prefer_live=True, require_live=True)
+        exists = out_file.is_file()
+        sz = out_file.stat().st_size if exists else 0
+        res["output_exists"] = exists
+        res["output_size"] = sz
+        res["reopen_verified"] = None
+        if not exists or sz == 0:
+            res["ok"] = False
+            res["command_success"] = False
+            res["execution_stage"] = "output_verification_failed"
+            res["error_code"] = "OUTPUT_FILE_MISSING"
+            res["error"] = f"Exported {fmt.upper()} file was not created or is empty: {abs_out}"
+        else:
+            res["execution_stage"] = "output_verified"
+        return _json_response(res)
 
     if fmt == "png":
-        execute_autolisp_dual_mode('(command "_.ZOOM" "_E")')
+        t0 = time.time()
+        out_file.unlink(missing_ok=True)
+        execute_autolisp_dual_mode('(command "_.ZOOM" "_E")', prefer_live=True)
         try:
             subprocess.run(["screencapture", "-x", abs_out], check=True, timeout=5)
-            return _json_response({"ok": True, "format": "png", "path": abs_out})
+            exists = out_file.is_file()
+            sz = out_file.stat().st_size if exists else 0
+            return _json_response(
+                ensure_diagnostic_fields(
+                    {
+                        "ok": exists and sz > 0,
+                        "format": "png",
+                        "path": abs_out,
+                        "output_exists": exists,
+                        "output_size": sz,
+                    },
+                    requested_mode="live_gui",
+                    actual_mode="live_gui",
+                    elapsed_ms=int((time.time() - t0) * 1000),
+                    execution_stage="output_verified" if (exists and sz > 0) else "output_verification_failed",
+                )
+            )
         except Exception as e:
-            return _json_response({"ok": False, "error": f"Failed to capture PNG: {e}"})
+            return _json_response(
+                ensure_diagnostic_fields(
+                    {
+                        "ok": False,
+                        "error_code": "PNG_CAPTURE_FAILED",
+                        "error": f"Failed to capture PNG: {e}",
+                        "output_exists": False,
+                        "output_size": 0,
+                    },
+                    requested_mode="live_gui",
+                    actual_mode="live_gui",
+                    elapsed_ms=int((time.time() - t0) * 1000),
+                    execution_stage="output_verification_failed",
+                )
+            )
 
-    return _json_response({"ok": False, "error": f"Unsupported export format: {format}"})
+    return _json_response({"ok": False, "error_code": "UNSUPPORTED_FORMAT", "error": f"Unsupported export format: {format}"})
 
 
 @mcp.tool()
@@ -865,15 +998,17 @@ def run_accoreconsole_script(
     is_lisp: bool = True,
     input_dwg: Optional[str] = None,
     save_as_dwg: Optional[str] = None,
+    verify_reopen: bool = True,
     timeout_sec: float = 45.0,
 ) -> str:
-    """Run a batch AutoLISP or .scr script in AutoCAD 2027's headless AcCoreConsole.
+    """Run a batch AutoLISP or .scr script in AutoCAD 2027's headless AcCoreConsole with UTF-8 + save reopen verification.
 
     Args:
         script_or_lisp: AutoLISP expressions (if is_lisp=True) or raw AutoCAD .scr script lines (if is_lisp=False).
         is_lisp: Whether script_or_lisp is AutoLISP code (True) or raw .scr commands (False).
         input_dwg: Optional input .dwg file path to open in AcCoreConsole.
         save_as_dwg: Optional output .dwg file path to save after execution.
+        verify_reopen: When save_as_dwg is provided, verify the saved file exists, is non-empty, and reopens cleanly in AcCoreConsole before returning saved_dwg.
         timeout_sec: Maximum execution time in seconds.
     """
     runner = get_console_runner()
@@ -882,12 +1017,15 @@ def run_accoreconsole_script(
             lisp_code=script_or_lisp,
             input_dwg=input_dwg,
             save_as_dwg=save_as_dwg,
+            verify_reopen=verify_reopen,
             timeout=timeout_sec,
         )
     else:
         res = runner.run_script_file(
             script_content=script_or_lisp,
             input_dwg=input_dwg,
+            save_as_dwg=save_as_dwg,
+            verify_reopen=verify_reopen,
             timeout=timeout_sec,
         )
     return _json_response(res)
@@ -900,15 +1038,19 @@ def inspect_or_create_dxf(
     action: str = "inspect",
     entities_spec: Optional[List[Dict[str, Any]]] = None,
     open_in_autocad: bool = False,
+    open_wait_seconds: float = 12.0,
 ) -> str:
-    """High-speed offline DXF inspection or creation using ezdxf, with optional handoff to AutoCAD 2027.
+    """High-speed offline DXF inspection or creation using ezdxf, with verified handoff to AutoCAD 2027.
 
     Args:
         dxf_path: Path to the .dxf file to inspect or create.
         action: 'inspect' to read layers/entities summary of an existing DXF, or 'create' to generate a new DXF from entities_spec.
         entities_spec: For action='create', a list of dicts describing entities, e.g. [{'type': 'LINE', 'start': [0,0], 'end': [100,0], 'layer': 'WALL'}, {'type': 'CIRCLE', 'center': [50,50], 'radius': 20}].
-        open_in_autocad: If True, opens the DXF file in the AutoCAD 2027 GUI after completion.
+        open_in_autocad: If True, opens the DXF file in the AutoCAD 2027 GUI and verifies that AutoCAD finishes loading it.
+        open_wait_seconds: Maximum time to wait for AutoCAD GUI to finish loading the document when open_in_autocad=True.
     """
+    t0 = time.time()
+    req_id = new_request_id("dxf")
     abs_path = Path(dxf_path).expanduser().resolve()
     act = action.lower().strip()
 
@@ -962,11 +1104,37 @@ def inspect_or_create_dxf(
             doc.saveas(str(abs_path))
         elif act == "inspect":
             if not abs_path.exists():
-                return _json_response({"ok": False, "error": f"DXF file not found: {abs_path}"})
+                return _json_response(
+                    ensure_diagnostic_fields(
+                        {
+                            "ok": False,
+                            "error_code": "DXF_FILE_NOT_FOUND",
+                            "error": f"DXF file not found: {abs_path}",
+                        },
+                        requested_mode="ezdxf_offline",
+                        actual_mode="ezdxf_offline",
+                        request_id=req_id,
+                        elapsed_ms=int((time.time() - t0) * 1000),
+                        execution_stage="precheck_failed",
+                    )
+                )
             doc = ezdxf.readfile(str(abs_path))
             msp = doc.modelspace()
         else:
-            return _json_response({"ok": False, "error": f"Unsupported action: {action}"})
+            return _json_response(
+                ensure_diagnostic_fields(
+                    {
+                        "ok": False,
+                        "error_code": "UNSUPPORTED_ACTION",
+                        "error": f"Unsupported action: {action}",
+                    },
+                    requested_mode="ezdxf_offline",
+                    actual_mode="ezdxf_offline",
+                    request_id=req_id,
+                    elapsed_ms=int((time.time() - t0) * 1000),
+                    execution_stage="precheck_failed",
+                )
+            )
 
         type_counts: Dict[str, int] = {}
         for e in msp:
@@ -974,24 +1142,58 @@ def inspect_or_create_dxf(
             type_counts[t] = type_counts.get(t, 0) + 1
 
         layers = [lyr.dxf.name for lyr in doc.layers]
+        exists = abs_path.is_file()
+        sz = abs_path.stat().st_size if exists else 0
+
+        result_payload: Dict[str, Any] = {
+            "ok": True,
+            "action": act,
+            "dxf_path": str(abs_path),
+            "dxf_version": doc.dxfversion,
+            "layers": layers,
+            "entity_counts_by_type": type_counts,
+            "total_entities": sum(type_counts.values()),
+            "output_exists": exists if act == "create" else None,
+            "output_size": sz if act == "create" else None,
+            "open_dispatched": False,
+            "document_loaded_verified": False,
+            "opened_in_autocad": False,
+        }
 
         if open_in_autocad:
-            subprocess.run(["open", "-a", AUTOCAD_APP_PATH, str(abs_path)], check=False, timeout=5)
+            open_info = open_and_verify_in_autocad(str(abs_path), wait_seconds=open_wait_seconds)
+            result_payload.update(open_info)
+            if not open_info.get("document_loaded_verified"):
+                result_payload["ok"] = False
+                result_payload["command_success"] = False
+                result_payload["execution_stage"] = "open_verification_failed"
+            else:
+                result_payload["execution_stage"] = "document_loaded_verified"
 
         return _json_response(
-            {
-                "ok": True,
-                "action": act,
-                "dxf_path": str(abs_path),
-                "dxf_version": doc.dxfversion,
-                "layers": layers,
-                "entity_counts_by_type": type_counts,
-                "total_entities": sum(type_counts.values()),
-                "opened_in_autocad": open_in_autocad,
-            }
+            ensure_diagnostic_fields(
+                result_payload,
+                requested_mode="live_gui" if open_in_autocad else "ezdxf_offline",
+                actual_mode="live_gui" if open_in_autocad else "ezdxf_offline",
+                request_id=req_id,
+                elapsed_ms=int((time.time() - t0) * 1000),
+            )
         )
     except Exception as e:
-        return _json_response({"ok": False, "error": str(e)})
+        return _json_response(
+            ensure_diagnostic_fields(
+                {
+                    "ok": False,
+                    "error_code": "DXF_OPERATION_FAILED",
+                    "error": str(e),
+                },
+                requested_mode="ezdxf_offline",
+                actual_mode="ezdxf_offline",
+                request_id=req_id,
+                elapsed_ms=int((time.time() - t0) * 1000),
+                execution_stage="failed",
+            )
+        )
 
 
 def main() -> None:

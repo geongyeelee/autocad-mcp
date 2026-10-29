@@ -108,9 +108,17 @@
   )
 )
 
+(defun mcp:open-utf8 (filepath mode / fp)
+  (setq fp (vl-catch-all-apply 'open (list filepath mode "utf8")))
+  (if (vl-catch-all-error-p fp)
+    (open filepath mode)
+    fp
+  )
+)
+
 (defun mcp:read-file-text (filepath / fp line content)
   (setq content "")
-  (if (setq fp (open filepath "r"))
+  (if (setq fp (mcp:open-utf8 filepath "r"))
     (progn
       (while (setq line (read-line fp))
         (setq content (strcat content line "\n"))
@@ -123,7 +131,7 @@
 
 (defun mcp:write-atomic-json (resp-path json-payload / tmp-path fp)
   (setq tmp-path (strcat resp-path ".tmp"))
-  (if (setq fp (open tmp-path "w"))
+  (if (setq fp (mcp:open-utf8 tmp-path "w"))
     (progn
       (write-line json-payload fp)
       (close fp)
@@ -135,28 +143,101 @@
   )
 )
 
-(defun mcp:exec-file (req-path resp-path / code-str wrapped-expr parsed-res eval-res json-out old-cmdecho)
+(defun mcp:current-doc-path ( / pfx nam)
+  (setq pfx (getvar "DWGPREFIX")
+        nam (getvar "DWGNAME"))
+  (if (and pfx nam)
+    (strcat pfx nam)
+    (if nam nam "")
+  )
+)
+
+(defun mcp:total-entity-count ( / ss)
+  (setq ss (ssget "_X"))
+  (if ss (sslength ss) 0)
+)
+
+(defun mcp:is-cmd-busy (cmd-active cmd-names)
+  (or (and cmd-active (/= (logand cmd-active 11) 0))
+      (and cmd-names (/= cmd-names "")))
+)
+
+(defun mcp:exec-file (req-path resp-path / code-str wrapped-expr parsed-res eval-res json-out old-cmdecho cmd-names cmd-active err-no doc-path is-busy busy-flag cmd-ok ent-before ent-after)
   (setq old-cmdecho (getvar "CMDECHO"))
   (setvar "CMDECHO" 0)
+  (setvar "ERRNO" 0)
+  (setq ent-before (mcp:total-entity-count))
   (setq code-str (mcp:read-file-text req-path))
   (setq wrapped-expr (strcat "(progn\n" code-str "\n)"))
   (setq parsed-res (vl-catch-all-apply 'read (list wrapped-expr)))
   (if (vl-catch-all-error-p parsed-res)
-    (setq json-out
-      (strcat "{\"ok\":false,\"error\":\"LISP Syntax Error: "
-              (mcp:json-escape (vl-catch-all-error-message parsed-res))
-              "\"}"))
+    (progn
+      (setq cmd-names (getvar "CMDNAMES")
+            cmd-active (getvar "CMDACTIVE")
+            doc-path (mcp:current-doc-path)
+            is-busy (mcp:is-cmd-busy cmd-active cmd-names)
+            busy-flag (if is-busy "true" "false"))
+      (setq json-out
+        (strcat "{\"ok\":false"
+                ",\"script_success\":false"
+                ",\"command_success\":false"
+                ",\"execution_stage\":\"lisp_parse_failed\""
+                ",\"error_code\":\"LISP_SYNTAX_ERROR\""
+                ",\"entity_count_before\":" (itoa ent-before)
+                ",\"entity_count_after\":" (itoa ent-before)
+                ",\"active_document\":\"" (mcp:json-escape doc-path) "\""
+                ",\"command_names\":\"" (mcp:json-escape (if cmd-names cmd-names "")) "\""
+                ",\"busy\":" busy-flag
+                ",\"error\":\"LISP Syntax Error: "
+                (mcp:json-escape (vl-catch-all-error-message parsed-res))
+                "\"}")))
     (progn
       (setq eval-res (vl-catch-all-apply 'eval (list parsed-res)))
+      (setq cmd-names (getvar "CMDNAMES")
+            cmd-active (getvar "CMDACTIVE")
+            err-no (getvar "ERRNO")
+            ent-after (mcp:total-entity-count)
+            doc-path (mcp:current-doc-path)
+            is-busy (mcp:is-cmd-busy cmd-active cmd-names)
+            busy-flag (if is-busy "true" "false"))
       (if (vl-catch-all-error-p eval-res)
         (setq json-out
-          (strcat "{\"ok\":false,\"error\":\"LISP Runtime Error: "
+          (strcat "{\"ok\":false"
+                  ",\"script_success\":false"
+                  ",\"command_success\":false"
+                  ",\"execution_stage\":\"lisp_eval_failed\""
+                  ",\"error_code\":\"LISP_RUNTIME_ERROR\""
+                  ",\"errno\":" (itoa (if err-no err-no 0))
+                  ",\"entity_count_before\":" (itoa ent-before)
+                  ",\"entity_count_after\":" (itoa ent-after)
+                  ",\"active_document\":\"" (mcp:json-escape doc-path) "\""
+                  ",\"command_names\":\"" (mcp:json-escape (if cmd-names cmd-names "")) "\""
+                  ",\"busy\":" busy-flag
+                  ",\"error\":\"LISP Runtime Error: "
                   (mcp:json-escape (vl-catch-all-error-message eval-res))
                   "\"}"))
-        (setq json-out
-          (strcat "{\"ok\":true,\"result\":"
-                  (mcp:to-json eval-res)
-                  "}"))
+        (progn
+          (setq cmd-ok (not is-busy))
+          (setq json-out
+            (strcat "{\"ok\":" (if cmd-ok "true" "false")
+                    ",\"script_success\":true"
+                    ",\"command_success\":" (if cmd-ok "true" "false")
+                    ",\"execution_stage\":\"" (if cmd-ok "command_completed" "command_incomplete") "\""
+                    ",\"error_code\":" (if cmd-ok "null" "\"COMMAND_STILL_ACTIVE\"")
+                    ",\"errno\":" (itoa (if err-no err-no 0))
+                    ",\"entity_count_before\":" (itoa ent-before)
+                    ",\"entity_count_after\":" (itoa ent-after)
+                    ",\"active_document\":\"" (mcp:json-escape doc-path) "\""
+                    ",\"command_names\":\"" (mcp:json-escape (if cmd-names cmd-names "")) "\""
+                    ",\"busy\":" busy-flag
+                    (if cmd-ok
+                      ""
+                      (strcat ",\"error\":\"Command left active after script execution: "
+                              (mcp:json-escape (if cmd-names cmd-names "")) "\""))
+                    ",\"result\":"
+                    (mcp:to-json eval-res)
+                    "}"))
+        )
       )
     )
   )
