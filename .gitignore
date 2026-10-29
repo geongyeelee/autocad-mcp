@@ -1,0 +1,18 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# macOS & compiled artifacts
+.DS_Store
+bridge/*.bundle/
+bridge/*.crx/
+*.dwg
+*.dxf
+*.bak
+*.log
